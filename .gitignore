@@ -1,0 +1,17 @@
+# Secrets
+google_key.json
+*.json.key
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+env/
+
+# Generated output
+static/uploads/
+static/outputs/
+
+# OS
+.DS_Store

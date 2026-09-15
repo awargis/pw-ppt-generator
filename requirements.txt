@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+pydantic
+
+flask
+PyMuPDF
+google-cloud-vision
+Pillow
+python-pptx
+gunicorn
