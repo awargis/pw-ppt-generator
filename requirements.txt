@@ -1,10 +1,7 @@
-fastapi
-uvicorn[standard]
-pydantic
-
-flask
-PyMuPDF
-google-cloud-vision
-Pillow
+streamlit
 python-pptx
-gunicorn
+google-cloud-vision
+pdf2image
+pillow
+opencv-python
+pypdf
