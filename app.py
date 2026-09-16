@@ -1,89 +1,139 @@
-from flask import Flask, render_template, request, send_file, jsonify
 import os
+import io
+import re
 import json
 import zipfile
-from ocr_processor import detect_question_boundaries
-from pdf_cropper import crop_and_invert
-from ppt_generator import build_subject_ppt
+import shutil
+import tempfile
+import numpy as np
+import cv2
+import streamlit as st
+from pdf2image import convert_from_bytes
+from PIL import Image, ImageOps, ImageEnhance
+from pptx import Presentation
+from pptx.util import Inches, Pt
+from pptx.dml.color import RGBColor
+import google.generativeai as genai
 
-# --- Google Vision credentials from env var (Railway-safe) ---
-creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
-if creds_json:
-    creds_path = "/tmp/google_key.json"
-    with open(creds_path, "w") as f:
-        f.write(creds_json)
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds_path
+# Page Config
+st.set_page_config(
+    page_title="Auto Question Paper to PPT Generator",
+    page_icon="📚",
+    layout="wide"
+)
 
-app = Flask(__name__)
+# Custom Styling
+st.markdown("""
+    <style>
+    .main-title { font-size: 28px; font-weight: bold; color: #FF4B4B; }
+    .stButton>button { background-color: #4CAF50; color: white; font-weight: bold; font-size: 18px; border-radius: 8px; width: 100%; height: 50px;}
+    </style>
+""", unsafe_allow_html=True)
 
-UPLOAD_DIR = 'static/uploads'
-OUTPUT_DIR = 'static/outputs'
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+st.title("📚 Automated Question Paper to Subject PPT Generator")
+st.write("PDF Upload karein, Sample PPT Template dein aur 1-Click me Subject-wise Dark Mode PPTs download karein!")
 
+# Sidebar Configuration
+st.sidebar.header("⚙️ Configuration Settings")
 
-@app.route('/')
-def index():
-    return render_template('index.html')
+# Exam Type Selection
+exam_type = st.sidebar.radio(
+    "1. Select Exam Type",
+    ["JEE (3 Subjects)", "NEET (4 Subjects)"],
+    index=0
+)
 
+if "JEE" in exam_type:
+    subjects = ["Physics", "Chemistry", "Mathematics"]
+else:
+    subjects = ["Physics", "Chemistry", "Botany", "Zoology"]
 
-@app.route('/process', methods=['POST'])
-def process():
-    paper_type = request.form.get('paper_type', 'JEE')
-    pdf_file = request.files.get('question_paper')
+st.sidebar.info(f"📁 Folders/PPTs Created: **{', '.join(subjects)}**")
 
-    if not pdf_file:
-        return jsonify({"status": "error", "message": "No file uploaded"}), 400
+# Gemini API Key (Optional for precise AI cropping)
+gemini_api_key = st.sidebar.text_input("Google Gemini API Key (Optional for AI OCR)", type="password", help="Agar API Key hai toh daalein, warna Smart Contour Cropper automatically kaam karega.")
 
-    pdf_path = os.path.join(UPLOAD_DIR, pdf_file.filename)
-    pdf_file.save(pdf_path)
+# File Uploaders
+st.sidebar.subheader("2. Upload Files")
+pdf_file = st.sidebar.file_uploader("Upload Question Paper (PDF)", type=["pdf"])
+template_ppt = st.sidebar.file_uploader("Upload Sample PPT Template (.pptx)", type=["pptx"])
 
-    questions = detect_question_boundaries(pdf_path)
-    total_q = len(questions)
+# Answer Key Section
+st.subheader("📝 Answer Key Input")
+ans_key_text = st.text_area(
+    "Paste Answer Key here (Format: 1:A, 2:C, 3:2, 4:4 or line by line)",
+    height=120,
+    placeholder="1: 2\n2: 4\n3: 1\n4: 3\n..."
+)
 
-    if total_q == 0:
-        return jsonify({"status": "error", "message": "No questions detected in PDF"}), 400
+# Parse Answer Key
+answer_dict = {}
+if ans_key_text:
+    matches = re.findall(r'(\d+)[\s:\-\.]+\(?([1-4A-Da-d]+)\)?', ans_key_text)
+    for q_num, ans in matches:
+        answer_dict[int(q_num)] = ans.upper()
 
-    subjects = ['Physics', 'Chemistry', 'Mathematics'] if paper_type == 'JEE' \
-        else ['Physics', 'Chemistry', 'Botany', 'Zoology']
-    q_per_subj = max(1, total_q // len(subjects))
+# Helper Functions
+def invert_to_black_bg(pil_img):
+    """ Converts cropped image to Black Background with Crisp White Text """
+    if pil_img.mode != 'RGB':
+        pil_img = pil_img.convert('RGB')
+    
+    # Invert colors (White -> Black, Black -> White)
+    inverted = ImageOps.invert(pil_img)
+    
+    # Enhance contrast and sharpness
+    enhancer_c = ImageEnhance.Contrast(inverted)
+    inverted = enhancer_c.enhance(1.8)
+    
+    enhancer_b = ImageEnhance.Brightness(inverted)
+    inverted = enhancer_b.enhance(1.1)
+    
+    return inverted
 
-    generated_ppts = []
+def auto_crop_questions_opencv(page_img):
+    """ Smart OpenCV Whitespace Segmentation for Cropping Questions """
+    cv_img = cv2.cvtColor(np.array(page_img), cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+    
+    # Thresholding
+    _, thresh = cv2.threshold(gray, 220, 255, cv2.THRESH_BINARY_INV)
+    
+    # Horizontal projection profile to find question breaks
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (cv_img.shape[1], 15))
+    dilated = cv2.dilate(thresh, kernel, iterations=2)
+    
+    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    crops = []
+    h_img, w_img, _ = cv_img.shape
+    
+    boxes = [cv2.boundingRect(c) for c in contours]
+    # Sort top-to-bottom
+    boxes = sorted(boxes, key=lambda b: b[1])
+    
+    for x, y, w, h in boxes:
+        if h > 80 and w > w_img * 0.3: # Filter tiny text lines or header noise
+            crop = page_img.crop((x, y, x + w, y + h))
+            crops.append(crop)
+            
+    return crops if crops else [page_img]
 
-    for idx, subj in enumerate(subjects):
-        if idx < len(subjects) - 1:
-            subj_q_list = questions[idx * q_per_subj:(idx + 1) * q_per_subj]
-        else:
-            subj_q_list = questions[idx * q_per_subj:]
-
-        cropped_imgs = []
-        for q_idx, q_info in enumerate(subj_q_list):
-            crop_path = os.path.join(OUTPUT_DIR, paper_type, subj, f"Q_{q_idx+1}.png")
-            crop_and_invert(pdf_path, q_info["page"], q_info["ymin"], q_info["ymax"], crop_path)
-            cropped_imgs.append(crop_path)
-
-        ppt_path = os.path.join(OUTPUT_DIR, paper_type, f"{subj}.pptx")
-        build_subject_ppt('templates/template.pptx', cropped_imgs, ppt_path)
-        generated_ppts.append(ppt_path)
-
-    zip_name = f"{paper_type}_Output_PPTs.zip"
-    zip_path = os.path.join(OUTPUT_DIR, zip_name)
-    with zipfile.ZipFile(zip_path, 'w') as zipf:
-        for ppt in generated_ppts:
-            zipf.write(ppt, os.path.basename(ppt))
-
-    return jsonify({"status": "success", "download_url": f"/download?file={zip_path}"})
-
-
-@app.route('/download')
-def download():
-    file_path = request.args.get('file')
-    # basic safety: only allow files inside OUTPUT_DIR
-    if not file_path or not os.path.abspath(file_path).startswith(os.path.abspath(OUTPUT_DIR)):
-        return jsonify({"status": "error", "message": "Invalid file"}), 400
-    return send_file(file_path, as_attachment=True)
-
-
-if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
+def get_gemini_question_boxes(page_img, api_key):
+    """ Uses Gemini Vision API to detect exact question bounding boxes """
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        
+        prompt = """
+        Detect all question numbers and their exact bounding boxes on this page.
+        Return ONLY a JSON array like this:
+        [
+          {"q_num": 1, "box_2d": [ymin, xmin, ymax, xmax]},
+          ...
+        ]
+        Box coordinates should be normalized from 0 to 1000. Do not include markdown code block syntax.
+        """
+        
+        response = model.generate_content([prompt, page_img])
+        clean_text = response.text.replace("```json", "").replace("
