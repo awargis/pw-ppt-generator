@@ -1,7 +1,6 @@
 streamlit
-python-pptx
-google-cloud-vision
-pdf2image
+google-genai
 pillow
-opencv-python
+pdf2image
+python-pptx
 pypdf
