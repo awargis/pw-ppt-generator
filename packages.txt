@@ -1,5 +1,4 @@
 poppler-utils
-libgl1-mesa-glx
-libglib2.0-0
 libgl1
+libglib2.0-0
 libglib2.0-0
