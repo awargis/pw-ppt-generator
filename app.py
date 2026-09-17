@@ -72,7 +72,7 @@ st.sidebar.header("⚙️ Configuration")
 gemini_api_key = st.sidebar.text_input("Gemini API Key", type="password")
 model_name = st.sidebar.selectbox(
     "Gemini model",
-    ["gemini-2.5-flash", "gemini-3.5-flash ","gemini-3.5-flash-lite","gemini-3-flash-preview","gemini-2.5-pro"],
+    ["gemini-2.5-flash", "gemini-2.5-pro"],
     help="Flash = faster/cheaper. Pro = slightly more accurate on dense/cramped pages.",
 )
 exam_type = st.sidebar.selectbox("Exam Type", ["JEE Main / Advanced", "NEET"])
@@ -293,21 +293,41 @@ def split_columns(page_img: Image.Image, outer_margin_pct: float, col_gap_pct: f
 # ============================================================================
 # PPTX HELPERS  (duplicate / move / delete slide, text swap, image insert)
 # ============================================================================
+_R_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+
+
 def duplicate_slide(prs: Presentation, index: int):
+    """Clone a slide (shapes, formatting, images) onto a new slide at the end
+    of the deck. Relationship IDs are NOT guaranteed to be preserved by
+    python-pptx's public API (it always assigns a fresh rId), so instead of
+    relying on the old rId, we build an old-rId -> new-rId map as we copy each
+    relationship, then rewrite every r:embed / r:id / r:link attribute in the
+    copied XML to point at the new rId. This keeps working across python-pptx
+    versions where the relationships collection has no add_relationship()."""
     src = prs.slides[index]
     layout = src.slide_layout
     new_slide = prs.slides.add_slide(layout)
     for shp in list(new_slide.shapes):
         shp._element.getparent().remove(shp._element)
-    for shp in src.shapes:
-        new_slide.shapes._spTree.append(copy.deepcopy(shp._element))
-    for rId, rel in src.part.rels.items():
+
+    rid_map = {}
+    for old_rId, rel in src.part.rels.items():
         if "notesSlide" in rel.reltype or "slideLayout" in rel.reltype:
             continue
         if rel.is_external:
-            new_slide.part.rels.add_relationship(rel.reltype, rel._target, rId, is_external=True)
+            new_rId = new_slide.part.relate_to(rel.target_ref, rel.reltype, is_external=True)
         else:
-            new_slide.part.rels.add_relationship(rel.reltype, rel.target_part, rId)
+            new_rId = new_slide.part.relate_to(rel.target_part, rel.reltype)
+        rid_map[old_rId] = new_rId
+
+    for shp in src.shapes:
+        new_el = copy.deepcopy(shp._element)
+        for el in new_el.iter():
+            for attr_name, attr_val in list(el.attrib.items()):
+                if attr_name.startswith(_R_NS) and attr_val in rid_map:
+                    el.set(attr_name, rid_map[attr_val])
+        new_slide.shapes._spTree.append(new_el)
+
     return new_slide
 
 
