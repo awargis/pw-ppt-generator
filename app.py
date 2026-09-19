@@ -1,24 +1,5 @@
-import streamlit as st
-from models import DetectedItem
-from services.gemini_service import GeminiService
-from services.pdf_service import render_pdf, split_page_columns
-from services.crop_service import normalized_box_to_absolute, crop_question
-from services.subject_service import normalize_subject
-from services.answer_key_service import parse_answer_key_text
-from services.ppt_service import build_subject_ppt
-from services.output_service import create_subject_outputs
-from ui.sidebar import render_sidebar
-from ui.preview import render_question_preview
-from ui.report import render_counts
-
-st.set_page_config(page_title="Vidyapeeth PPT Generator", layout="wide")
-st.title("📚 Vidyapeeth Test PPT Generator")
-
-settings = render_sidebar()
-
-pdf_file = st.file_uploader("1. Question Paper PDF", type=["pdf"])
-template_file = st.file_uploader("2. Sample PPT Template", type=["pptx"])
-answer_key_text = st.text_area("3. Answer key", placeholder="1: (3)\n2: (1)")
+import time # Add this to the top of app.py with your other imports
+from tenacity import RetryError
 
 def process_pipeline():
     gemini = GeminiService(api_key=settings["api_key"], model_name=settings["model_name"])
@@ -33,6 +14,9 @@ def process_pipeline():
             completed += 1
             progress.progress(completed / total)
             status.text(f"Scanning Page {p_idx + 1}, Column {c_idx + 1}...")
+
+            # Add a delay to prevent hitting free-tier RPM limits
+            time.sleep(3.5) 
 
             detected = gemini.detect_column_items(col_img, settings["subjects"])
             for item in detected:
@@ -78,6 +62,7 @@ def process_pipeline():
     for sub in grouped: grouped[sub].sort(key=lambda i: i["number"])
     return grouped
 
+
 if st.button("🚀 Process & Generate", type="primary"):
     if not pdf_file or not template_file or not settings["api_key"]:
         st.error("Upload required files and enter API key.")
@@ -105,5 +90,8 @@ if st.button("🚀 Process & Generate", type="primary"):
             mime="application/zip",
             type="primary"
         )
+    except RetryError as e:
+        # This unwraps the Tenacity error to show the exact Gemini API failure
+        st.error(f"API Error: The Gemini API rejected the request after multiple retries. Details: {e.last_attempt.exception()}")
     except Exception as e:
         st.error(f"Failed: {e}")
