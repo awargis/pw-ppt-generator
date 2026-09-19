@@ -6,7 +6,7 @@ from models import DetectedItem
 from services.gemini_service import GeminiService
 from services.pdf_service import render_pdf, split_page_columns
 from services.crop_service import normalized_box_to_absolute, crop_question
-from services.subject_service import assign_subject_by_number
+from services.subject_service import normalize_subject
 from services.answer_key_service import parse_answer_key_text
 from services.ppt_service import build_subject_ppt
 from services.output_service import create_subject_outputs
@@ -29,7 +29,7 @@ def process_pipeline(app_settings, uploaded_pdf):
     with st.spinner("Rasterizing PDF to high-DPI images..."):
         pages = render_pdf(uploaded_pdf.read(), dpi=app_settings.get("render_dpi", 300))
     
-    raw_questions = []
+    all_items = []
     total_columns = len(pages) * 2
     completed = 0
     
@@ -47,9 +47,10 @@ def process_pipeline(app_settings, uploaded_pdf):
             detected = gemini.detect_column_items(col_img, app_settings["subjects"])
             for item in detected:
                 try:
+                    box = normalized_box_to_absolute(item["box_2d"], col_img.width, col_img.height, off_x, off_y)
+                    
                     if item.get("type") == "question" and item.get("question_number"):
-                        box = normalized_box_to_absolute(item["box_2d"], col_img.width, col_img.height, off_x, off_y)
-                        raw_questions.append(DetectedItem(
+                        all_items.append(DetectedItem(
                             kind="question", 
                             page_index=p_idx, 
                             column_index=c_idx, 
@@ -57,47 +58,58 @@ def process_pipeline(app_settings, uploaded_pdf):
                             question_number=int(item["question_number"]), 
                             confidence=item.get("confidence", 0.9)
                         ))
+                    elif item.get("type") == "section_header":
+                        all_items.append(DetectedItem(
+                            kind="section_header", 
+                            page_index=p_idx, 
+                            column_index=c_idx, 
+                            box=box,
+                            subject=normalize_subject(item.get("subject"), app_settings["subjects"])
+                        ))
                 except Exception:
                     continue
                 
     progress.empty()
     status.empty()
 
-    # De-duplicate questions (Keep the highest confidence detection)
-    unique_questions = {}
-    for q in raw_questions:
-        if q.question_number not in unique_questions or q.confidence > unique_questions[q.question_number].confidence:
-            unique_questions[q.question_number] = q
-            
-    # Sort strictly by Question Number, ignoring visual positions
-    sorted_questions = sorted(unique_questions.values(), key=lambda x: x.question_number)
+    # --- DYNAMIC CHRONOLOGICAL TRACKING ---
+    # Sort everything by physical position (Page -> Left/Right Column -> Top to Bottom)
+    all_items.sort(key=lambda i: i.sort_key)
 
     grouped = {sub: [] for sub in app_settings["subjects"]}
     grouped["Unclassified"] = []
     
-    status.text("Cropping and assigning subjects by boundaries...")
-    for q in sorted_questions:
-        # Enforce rigid Vidyapeeth subject boundaries
-        sub = assign_subject_by_number(q.question_number, app_settings["exam_type"])
-        
-        try:
-            img = crop_question(pages[q.page_index], q, app_settings.get("pad_x", 15), app_settings.get("pad_y", 10))
-            if sub in grouped:
-                grouped[sub].append({
-                    "number": q.question_number, 
+    current_subject = "Unclassified"
+    unique_questions = set()
+    
+    status.text("Cropping and assigning subjects dynamically...")
+    
+    for item in all_items:
+        if item.kind == "section_header" and item.subject:
+            # Change the active subject when a new header is found
+            current_subject = item.subject
+            
+        elif item.kind == "question":
+            # De-duplicate questions if Gemini accidentally detects the same one twice
+            if item.question_number in unique_questions:
+                continue
+            unique_questions.add(item.question_number)
+            
+            try:
+                img = crop_question(pages[item.page_index], item, app_settings.get("pad_x", 15), app_settings.get("pad_y", 10))
+                grouped[current_subject].append({
+                    "number": item.question_number, 
                     "image": img, 
-                    "page_index": q.page_index
+                    "page_index": item.page_index
                 })
-            else:
-                grouped["Unclassified"].append({
-                    "number": q.question_number, 
-                    "image": img, 
-                    "page_index": q.page_index
-                })
-        except ValueError: 
-            continue
+            except ValueError: 
+                continue
 
     status.empty()
+    # Final sort within each subject group by question number
+    for sub in grouped:
+        grouped[sub].sort(key=lambda i: i["number"])
+        
     return grouped
 
 
