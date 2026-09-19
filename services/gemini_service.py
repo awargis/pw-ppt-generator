@@ -1,70 +1,33 @@
 import io
 from google import genai
 from google.genai import types
+from pydantic import BaseModel, Field
+from typing import Literal
+from tenacity import retry, stop_after_attempt, wait_exponential
 
-from utils.json_utils import extract_json
+class DetectedBoundingBox(BaseModel):
+    type: Literal["question", "section_header"]
+    box_2d: list[float] = Field(description="[ymin, xmin, ymax, xmax] normalized 0-1000")
+    question_number: int | None = None
+    subject: str | None = None
+    confidence: float = 0.95
+    question_format: str = "unknown"
 
+class PageColumnDetection(BaseModel):
+    items: list[DetectedBoundingBox]
 
 DETECTION_PROMPT = """
 Analyze one column of a scanned examination paper.
-
-Return only a JSON array.
-
-For each question return:
-
-{
-  "type": "question",
-  "question_number": 1,
-  "box_2d": [ymin, xmin, ymax, xmax],
-  "confidence": 0.95,
-  "question_format": "mcq"
-}
-
-For each section header return:
-
-{
-  "type": "section_header",
-  "subject": "Physics",
-  "box_2d": [ymin, xmin, ymax, xmax],
-  "confidence": 0.95
-}
-
-Allowed question formats:
-- mcq
-- numerical
-- matching
-- assertion_reason
-- passage
-- descriptive
-- unknown
-
 Rules:
-- Include the full question.
-- Include all options.
-- Include diagrams, tables, graphs and passages.
+- Include the full question, all options, and diagrams.
 - Stop before the next question number.
-- Do not return a continuation as a new question.
 - Coordinates are normalized from 0 to 1000.
 """
-
-
-ANSWER_KEY_PROMPT = """
-Extract the answer key from this image.
-
-Return only JSON in this format:
-{
-  "1": "3",
-  "2": "1",
-  "3": "4"
-}
-"""
-
 
 class GeminiService:
     def __init__(self, api_key: str, model_name: str):
         if not api_key:
             raise ValueError("Gemini API key is required.")
-
         self.client = genai.Client(api_key=api_key)
         self.model_name = model_name
 
@@ -73,18 +36,34 @@ class GeminiService:
         image.save(buffer, format="PNG")
         return buffer.getvalue()
 
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
     def detect_column_items(self, image, subjects: list[str]) -> list[dict]:
-        prompt = DETECTION_PROMPT + (
-            f"\nAllowed subjects: {', '.join(subjects)}"
-        )
+        prompt = DETECTION_PROMPT + f"\nAllowed subjects: {', '.join(subjects)}"
 
         response = self.client.models.generate_content(
             model=self.model_name,
             contents=[
-                types.Part.from_bytes(
-                    data=self._image_bytes(image),
-                    mime_type="image/png",
-                ),
+                types.Part.from_bytes(data=self._image_bytes(image), mime_type="image/png"),
+                prompt,
+            ],
+            config=types.GenerateContentConfig(
+                temperature=0,
+                response_mime_type="application/json",
+                response_schema=PageColumnDetection,
+            ),
+        )
+        
+        # Convert Pydantic objects back to the dict format expected by the rest of the app
+        return [item.model_dump() for item in response.parsed.items]
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+    def extract_answer_key(self, image) -> dict[int, str]:
+        prompt = "Extract the answer key from this image. Return a strict JSON dictionary mapping question number (string) to option character (string)."
+        
+        response = self.client.models.generate_content(
+            model=self.model_name,
+            contents=[
+                types.Part.from_bytes(data=self._image_bytes(image), mime_type="image/png"),
                 prompt,
             ],
             config=types.GenerateContentConfig(
@@ -92,32 +71,9 @@ class GeminiService:
                 response_mime_type="application/json",
             ),
         )
-
-        result = extract_json(response.text)
-        return result if isinstance(result, list) else []
-
-    def extract_answer_key(self, image) -> dict[int, str]:
-        response = self.client.models.generate_content(
-            model=self.model_name,
-            contents=[
-                types.Part.from_bytes(
-                    data=self._image_bytes(image),
-                    mime_type="image/png",
-                ),
-                ANSWER_KEY_PROMPT,
-            ],
-            config=types.GenerateContentConfig(
-                temperature=0,
-                response_mime_type="application/json",
-            ),
-        )
-
-        raw = extract_json(response.text)
-
+        import json
         try:
-            return {
-                int(number): str(answer).upper()
-                for number, answer in raw.items()
-            }
-        except (AttributeError, TypeError, ValueError):
+            raw = json.loads(response.text)
+            return {int(k): str(v).upper() for k, v in raw.items()}
+        except Exception:
             return {}
