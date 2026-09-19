@@ -6,6 +6,3 @@ python-pptx>=0.6.23,<2
 numpy>=1.26,<3
 pytest>=8,<9
 ruff>=0.6,<1
-poppler-utils
-libgl1
-libglib2.0-0
