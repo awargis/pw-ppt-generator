@@ -1,27 +1,19 @@
-from dataclasses import dataclass, field
 import os
+from dataclasses import dataclass
 
 @dataclass
 class AppConfig:
     render_dpi: int = 300
-    crop_padding: int = 18
     column_gap_percent: float = 1.5
     outer_margin_percent: float = 1.2
-    invert_images: bool = False
     minimum_crop_width: int = 80
     minimum_crop_height: int = 40
-    output_directory: str = "output_processing"
 
     @property
     def poppler_path(self) -> str | None:
         return os.getenv("POPPLER_PATH") or None
 
-MODEL_CHOICES = [
-    "gemini-2.5-flash",
-    "gemini-2.5-pro",
-    "gemini-2.0-flash",
-]
-
+MODEL_CHOICES = ["gemini-2.5-flash", "gemini-2.5-pro"]
 JEE_SUBJECTS = ["Physics", "Chemistry", "Mathematics"]
 NEET_SUBJECTS = ["Physics", "Chemistry", "Botany", "Zoology"]
 
