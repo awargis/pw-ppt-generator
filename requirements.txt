@@ -6,6 +6,3 @@ python-pptx
 pypdf
 streamlit>=1.30.0
 PyMuPDF>=1.23.0
-python-pptx>=0.6.23
-Pillow>=10.0.0
-numpy>=1.24.0
