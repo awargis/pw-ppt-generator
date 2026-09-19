@@ -13,7 +13,7 @@ class AppConfig:
     def poppler_path(self) -> str | None:
         return os.getenv("POPPLER_PATH") or None
 
-MODEL_CHOICES = ["gemini-2.5-flash", "gemini-2.5-pro"]
+MODEL_CHOICES = ["gemini-2.5-flash","gemini-3.8-flash","gemini-3.7-flas",,"gemini-3.6-flash","gemini-3.5-flash", "gemini-2.5-pro"]
 JEE_SUBJECTS = ["Physics", "Chemistry", "Mathematics"]
 NEET_SUBJECTS = ["Physics", "Chemistry", "Botany", "Zoology"]
 
