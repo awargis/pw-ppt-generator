@@ -1,11 +1,6 @@
-
-Put all shared data structures here.
-
-```python
 from dataclasses import dataclass, field
 from PIL import Image
 from typing import Optional
-
 
 @dataclass
 class BoundingBox:
@@ -26,7 +21,6 @@ class BoundingBox:
     def is_valid(self) -> bool:
         return self.x1 > self.x0 and self.y1 > self.y0
 
-
 @dataclass
 class DetectedItem:
     kind: str
@@ -40,12 +34,7 @@ class DetectedItem:
 
     @property
     def sort_key(self):
-        return (
-            self.page_index,
-            self.column_index,
-            self.box.y0,
-        )
-
+        return (self.page_index, self.column_index, self.box.y0)
 
 @dataclass
 class QuestionCrop:
@@ -56,7 +45,6 @@ class QuestionCrop:
     confidence: float = 0.0
     question_format: str = "unknown"
 
-
 @dataclass
 class ProcessingReport:
     detected_questions: int = 0
@@ -66,5 +54,3 @@ class ProcessingReport:
     unclassified_questions: list[int] = field(default_factory=list)
     detected_subject_counts: dict[str, int] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
-```
-
