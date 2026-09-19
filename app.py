@@ -1,168 +1,230 @@
 import os
+import io
+import zipfile
+import tempfile
+import cv2
+import numpy as np
 import streamlit as st
+from PIL import Image
 from pdf2image import convert_from_bytes
+from pptx import Presentation
+from pptx.util import Emu
+from google import genai
+from google.genai import types
+from pydantic import BaseModel, Field
 
-from services.answer_key_service import parse_answer_key_text
-from services.crop_service import clip_neighbour_boxes, crop_question, normalized_box_to_absolute
-from services.gemini_service import GeminiService
-from services.output_service import create_subject_outputs
-from services.pdf_service import render_pdf, split_page_columns
-from services.ppt_service import build_subject_ppt
-from services.subject_service import normalize_subject
-from ui.preview import render_question_preview
-from ui.report import render_counts, render_download
-from ui.sidebar import render_sidebar
-from models import BoundingBox, DetectedItem
+# --- UI Configuration ---
+st.set_page_config(page_title="Vidyapeeth PPT Generator", layout="wide")
+st.title("📚 Test Paper to PPT Pipeline")
 
-st.set_page_config(page_title="PW Test PPT Generator", layout="wide")
-st.title("📚 PW Test PPT Generator")
+# --- Schemas ---
+class BoundingBox(BaseModel):
+    y_min: float = Field(description="Normalized top coordinate (0-1000)")
+    x_min: float = Field(description="Normalized left coordinate (0-1000)")
+    y_max: float = Field(description="Normalized bottom coordinate (0-1000)")
+    x_max: float = Field(description="Normalized right coordinate (0-1000)")
 
-settings = render_sidebar()
+class Question(BaseModel):
+    number: int
+    subject: str = Field(description="Strictly: Physics, Chemistry, Mathematics, Botany, or Zoology")
+    box: BoundingBox
 
-pdf_file = st.file_uploader("1. Question Paper PDF", type=["pdf"])
-template_file = st.file_uploader("2. Sample PPT Template", type=["pptx"])
-answer_key_text = st.text_area("Answer key", placeholder="1: (3)\n2: (1)\n3: (4)")
-answer_key_file = st.file_uploader("Optional answer key image/PDF", type=["png", "jpg", "jpeg", "pdf"])
+class PageExtraction(BaseModel):
+    questions: list[Question]
 
-def run_detection(pdf_bytes: bytes, gemini: GeminiService):
-    pages = render_pdf(pdf_bytes, dpi=settings["render_dpi"])
-    questions, headers = [], []
-    total = len(pages) * 2
-    progress, status = st.progress(0), st.empty()
-    completed = 0
+# --- Core Functions ---
+def process_image_dark_mode(crop_pil: Image.Image) -> io.BytesIO:
+    """Converts a standard crop into a high-contrast white-on-black image."""
+    # Convert PIL to OpenCV format
+    img_cv = cv2.cvtColor(np.array(crop_pil), cv2.COLOR_RGB2BGR)
+    
+    # Grayscale
+    gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+    
+    # Otsu's Binarization to strictly separate text from paper texture
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    # Invert (Make background black, text white)
+    inverted = cv2.bitwise_not(binary)
+    
+    # Convert back to PIL and save to buffer
+    final_pil = Image.fromarray(inverted)
+    img_buffer = io.BytesIO()
+    final_pil.save(img_buffer, format="PNG")
+    img_buffer.seek(0)
+    
+    return img_buffer
 
-    for page_index, page in enumerate(pages):
-        columns = split_page_columns(
-            page,
-            outer_margin_percent=settings["outer_margin"],
-            column_gap_percent=settings["column_gap"],
+def sort_questions_serially(questions_data, img_width):
+    """Sorts questions chronologically using dual-column layout logic."""
+    midpoint = img_width / 2
+    
+    def get_sort_key(q):
+        # Determine column: 0 for left, 1 for right
+        col = 0 if q['abs_box'][0] < midpoint else 1
+        # Sort by: Page Number -> Column -> Y-coordinate (Top to bottom)
+        return (q['page'], col, q['abs_box'][1])
+        
+    return sorted(questions_data, key=get_sort_key)
+
+def build_subject_ppt(template_bytes: bytes, questions: list, answers: dict) -> bytes:
+    """Clones the template slide and injects the dark-mode crops."""
+    prs = Presentation(io.BytesIO(template_bytes))
+    
+    # Find template slide index (assuming it's the first slide with #QUESTION)
+    template_slide = prs.slides[0]
+    slide_layout = template_slide.slide_layout
+    
+    # Content area bounding box (Adjust these based on exact template dimensions)
+    content_left, content_top = Emu(int(0.5 * 914400)), Emu(int(1.5 * 914400))
+    content_width, content_height = Emu(int(9.0 * 914400)), Emu(int(5.0 * 914400))
+
+    for q in questions:
+        new_slide = prs.slides.add_slide(slide_layout)
+        
+        # Replace placeholders
+        for shape in new_slide.shapes:
+            if shape.has_text_frame:
+                if "#QUESTION" in shape.text:
+                    shape.text = shape.text.replace("#QUESTION", f"Q{q['number']}")
+                if "Ans. (?)" in shape.text:
+                    ans = answers.get(str(q['number']), "")
+                    shape.text = shape.text.replace("Ans. (?)", f"Ans. ({ans})")
+        
+        # Insert Image
+        new_slide.shapes.add_picture(
+            q['img_buffer'], 
+            content_left, content_top, 
+            width=content_width
         )
 
-        for column_index, (column_image, offset_x, offset_y) in enumerate(columns):
-            completed += 1
-            progress.progress(min(completed / total, 1.0))
-            status.text(f"Analyzing page {page_index + 1}/{len(pages)}, column {column_index + 1}/2")
+    # Remove the original template slide
+    xml_slides = prs.slides._sldIdLst
+    xml_slides.remove(xml_slides[0])
+    
+    out_buffer = io.BytesIO()
+    prs.save(out_buffer)
+    return out_buffer.getvalue()
 
-            detected = gemini.detect_column_items(column_image, settings["subjects"])
+# --- Streamlit UI ---
+with st.sidebar:
+    st.header("⚙️ Settings")
+    api_key = st.text_input("Gemini API Key", type="password")
+    exam_track = st.radio("Exam Track", ["JEE", "NEET"])
+    
+    st.subheader("Crop Tuning")
+    pad_x = st.slider("Horizontal Padding", 0, 50, 15)
+    pad_y = st.slider("Vertical Padding", 0, 50, 10)
 
-            for item in detected:
-                if not isinstance(item, dict): continue
-                box_data = item.get("box_2d")
-                if not isinstance(box_data, list) or len(box_data) != 4: continue
+pdf_file = st.file_uploader("1. Upload Question Paper (PDF)", type="pdf")
+ppt_template = st.file_uploader("2. Upload PPT Template", type="pptx")
+answer_key_text = st.text_area("3. Answer Key (Format: 1:A, 2:B...)", height=100)
 
-                try:
-                    box = normalized_box_to_absolute(box_data, column_image.width, column_image.height, offset_x, offset_y)
-                except Exception:
-                    continue
-
-                item_type = item.get("type")
-                confidence = float(item.get("confidence", 0.8))
-
-                if item_type == "question":
-                    try:
-                        question_number = int(item["question_number"])
-                    except (KeyError, TypeError, ValueError):
-                        continue
-
-                    questions.append(DetectedItem(
-                        kind="question", page_index=page_index, column_index=column_index,
-                        box=box, question_number=question_number, confidence=confidence,
-                        question_format=item.get("question_format", "unknown"),
-                    ))
-
-                elif item_type == "section_header":
-                    if subject := normalize_subject(item.get("subject"), settings["subjects"]):
-                        headers.append(DetectedItem(
-                            kind="section_header", page_index=page_index, column_index=column_index,
-                            box=box, subject=subject, confidence=confidence,
-                        ))
-
-    progress.empty()
-    status.empty()
-
-    if not questions:
-        raise ValueError("No questions detected. Check the PDF quality, API key, or crop settings.")
-
-    return pages, questions, headers
-
-def build_question_groups(pages, questions, headers):
-    grouped = {subject: [] for subject in settings["subjects"]}
-    grouped["Unclassified"] = []
-
-    questions.sort(key=lambda item: item.sort_key)
-    headers.sort(key=lambda item: item.sort_key)
-
-    current_subject = None
-    header_index = 0
-
-    for question in questions:
-        while header_index < len(headers) and headers[header_index].sort_key <= question.sort_key:
-            current_subject = headers[header_index].subject
-            header_index += 1
-        question.subject = current_subject
-
-    columns = {}
-    for question in questions:
-        columns.setdefault((question.page_index, question.column_index), []).append(question)
-
-    for items in columns.values():
-        clip_neighbour_boxes(items)
-
-    for question in questions:
-        try:
-            image = crop_question(pages[question.page_index], question, padding=settings["crop_padding"], invert=settings["invert_images"])
-        except ValueError:
-            continue
-
-        subject = question.subject or "Unclassified"
-        grouped.setdefault(subject, []).append({
-            "number": question.question_number,
-            "image": image,
-            "page_index": question.page_index,
-            "confidence": question.confidence,
-            "question_format": question.question_format,
-        })
-
-    for subject in grouped:
-        grouped[subject].sort(key=lambda item: item["number"])
-
-    return grouped
-
-if st.button("🚀 Process & Generate All Subject PPTs", type="primary"):
-    if not pdf_file or not template_file or not settings["api_key"]:
-        st.error("Please upload required files and enter your Gemini API key.")
+if st.button("Generate PPTs", type="primary"):
+    if not api_key or not pdf_file or not ppt_template:
+        st.error("Please provide the API key, PDF, and PPT template.")
         st.stop()
 
-    try:
-        gemini = GeminiService(api_key=settings["api_key"], model_name=settings["model_name"])
-        answers = parse_answer_key_text(answer_key_text)
+    client = genai.Client(api_key=api_key)
+    subjects_map = {
+        "JEE": ["Physics", "Chemistry", "Mathematics"],
+        "NEET": ["Physics", "Chemistry", "Botany", "Zoology"]
+    }[exam_track]
 
-        if answer_key_file:
-            if answer_key_file.type == "application/pdf":
-                for page in convert_from_bytes(answer_key_file.read(), dpi=250):
-                    answers.update(gemini.extract_answer_key(page))
-            else:
-                from PIL import Image
-                answers.update(gemini.extract_answer_key(Image.open(answer_key_file)))
+    # Parse answers
+    answers = {}
+    if answer_key_text:
+        for pair in answer_key_text.replace("\n", ",").split(","):
+            if ":" in pair:
+                k, v = pair.split(":")
+                answers[k.strip()] = v.strip()
 
-        pages, questions, headers = run_detection(pdf_file.read(), gemini)
-        subject_questions = build_question_groups(pages, questions, headers)
+    with st.spinner("Rasterizing PDF to high-DPI images..."):
+        pages = convert_from_bytes(pdf_file.read(), dpi=300)
+
+    extracted_data = []
+    
+    progress = st.progress(0)
+    for i, page in enumerate(pages):
+        st.text(f"Extracting coordinates from Page {i+1}...")
         
-        zip_path, output_files = create_subject_outputs(
-            output_directory="output_processing",
-            template_bytes=template_file.read(),
-            subject_questions=subject_questions,
-            answers=answers,
-            build_ppt_function=build_subject_ppt,
-        )
+        img_byte_arr = io.BytesIO()
+        page.save(img_byte_arr, format='PNG')
+        img_bytes = img_byte_arr.getvalue()
 
-        subject_counts = {s: len(i) for s, i in subject_questions.items()}
-        st.success("All PPT files were generated successfully.")
+        prompt = f"Identify all questions on this page. Assign each to one of these subjects: {', '.join(subjects_map)}. Return normalized bounding boxes (0-1000)."
+        
+        try:
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[
+                    types.Part.from_bytes(data=img_bytes, mime_type="image/png"),
+                    prompt
+                ],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=PageExtraction,
+                    temperature=0.0
+                )
+            )
+            
+            page_width, page_height = page.size
+            
+            # Process coordinates and apply OpenCV filters
+            for q in response.parsed.questions:
+                # Convert 0-1000 scale to absolute pixels with padding
+                x0 = max(0, int((q.box.x_min / 1000) * page_width) - pad_x)
+                y0 = max(0, int((q.box.y_min / 1000) * page_height) - pad_y)
+                x1 = min(page_width, int((q.box.x_max / 1000) * page_width) + pad_x)
+                y1 = min(page_height, int((q.box.y_max / 1000) * page_height) + pad_y)
+                
+                crop = page.crop((x0, y0, x1, y1))
+                dark_img_buffer = process_image_dark_mode(crop)
+                
+                extracted_data.append({
+                    "number": q.number,
+                    "subject": q.subject,
+                    "page": i,
+                    "abs_box": (x0, y0, x1, y1),
+                    "img_buffer": dark_img_buffer
+                })
+                
+        except Exception as e:
+            st.error(f"Failed on page {i+1}: {e}")
+            
+        progress.progress((i + 1) / len(pages))
 
-        render_counts(subject_counts)
-        render_question_preview(subject_questions)
-        render_download(zip_path)
+    if not extracted_data:
+        st.error("No questions detected.")
+        st.stop()
 
-    except Exception as error:
-        st.error(f"Processing failed: {error}")
-        st.exception(error)
+    st.success("Extraction complete. Generating Subject PPTs...")
+
+    # Sort sequentially based on column layout
+    sorted_questions = sort_questions_serially(extracted_data, pages[0].size[0])
+
+    # Group by subject
+    subject_groups = {sub: [] for sub in subjects_map}
+    for q in sorted_questions:
+        if q['subject'] in subject_groups:
+            subject_groups[q['subject']].append(q)
+
+    # Generate PPTs and Zip in memory
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        template_bytes = ppt_template.read()
+        
+        for subject, qs in subject_groups.items():
+            if qs:
+                ppt_bytes = build_subject_ppt(template_bytes, qs, answers)
+                zip_file.writestr(f"{exam_track}_Test/{subject}/{subject}_Discussion.pptx", ppt_bytes)
+
+    zip_buffer.seek(0)
+    
+    st.download_button(
+        label="📦 Download Formatted PPTs",
+        data=zip_buffer,
+        file_name=f"{exam_track}_Test_Presentations.zip",
+        mime="application/zip",
+        type="primary"
+    )
