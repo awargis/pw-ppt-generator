@@ -1,8 +1,8 @@
-streamlit
-google-genai
-pillow
-pdf2image
-python-pptx
-pypdf
-streamlit>=1.30.0
-PyMuPDF>=1.23.0
+streamlit>=1.35,<2
+google-genai>=1,<2
+Pillow>=10,<12
+pdf2image>=1.17,<2
+python-pptx>=0.6.23,<2
+numpy>=1.26,<3
+pytest>=8,<9
+ruff>=0.6,<1
